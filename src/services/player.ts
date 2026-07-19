@@ -40,6 +40,9 @@ export type {AgeRestrictedFallbackResolver, PlayerEvents, QueuedPlaylist, Queued
 
 type PlayerPlaybackAttemptContext = PlaybackAttemptContext<QueuedSong, VoiceConnection>;
 
+export const NEXT_TRACK_PREFETCH_LEAD_SECONDS = 8;
+const MAX_CACHE_LENGTH_SECONDS = 30 * 60;
+
 export default class {
   public voiceConnection: VoiceConnection | null = null;
   public status = STATUS.PAUSED;
@@ -70,6 +73,8 @@ export default class {
   private voiceActivityVolumeTarget?: number;
   private voiceActivitySessionGeneration = 0;
   private hasRegisteredVoiceActivityListener = false;
+  private nextTrackPrefetchTimer: NodeJS.Timeout | undefined;
+  private readonly activePrefetches = new Map<string, Promise<void>>();
 
   constructor(fileCache: FileCacheProvider, guildId: string, ageRestrictedFallbackResolver?: AgeRestrictedFallbackResolver) {
     this.fileCache = fileCache;
@@ -373,12 +378,15 @@ export default class {
     if (this.getCurrent() !== currentSong) {
       this.currentQueueEntryVersion++;
     }
+
+    this.scheduleNextTrackPrefetch();
   }
 
   shuffle(): void {
     const shuffledSongs = shuffle(this.queue.slice(this.queuePosition + 1));
 
     this.queue = [...this.queue.slice(0, this.queuePosition + 1), ...shuffledSongs];
+    this.scheduleNextTrackPrefetch();
   }
 
   clear(): void {
@@ -393,15 +401,18 @@ export default class {
 
     this.queuePosition = 0;
     this.queue = newQueue;
+    this.scheduleNextTrackPrefetch();
   }
 
   removeFromQueue(index: number, amount = 1): void {
     this.queue.splice(this.queuePosition + index, amount);
+    this.scheduleNextTrackPrefetch();
   }
 
   removeCurrent(): void {
     this.queue = [...this.queue.slice(0, this.queuePosition), ...this.queue.slice(this.queuePosition + 1)];
     this.currentQueueEntryVersion++;
+    this.scheduleNextTrackPrefetch();
   }
 
   queueSize(): number {
@@ -425,6 +436,7 @@ export default class {
     }
 
     this.queue.splice(this.queuePosition + to, 0, this.queue.splice(this.queuePosition + from, 1)[0]);
+    this.scheduleNextTrackPrefetch();
 
     return this.queue[this.queuePosition + to];
   }
@@ -501,11 +513,10 @@ export default class {
     voiceConnection.subscribe(this.audioPlayer);
     this.playAudioPlayerResource(this.createAudioStream(stream));
     this.attachListeners();
-    this.startTrackingPosition(positionSeconds);
-
     this.status = STATUS.PLAYING;
     this.nowPlaying = currentSong;
     this.nowPlayingQueueEntryVersion = currentQueueEntryVersion;
+    this.startTrackingPosition(positionSeconds);
   }
 
   private async playWithAttempt(attempt: PlaybackAttemptToken, allowAgeRestrictedFallback: boolean): Promise<void> {
@@ -644,6 +655,10 @@ export default class {
       this.stopAudioPlayer(true);
     }
 
+    return this.createSongStream(song, options);
+  }
+
+  private async createSongStream(song: QueuedSong, options: {seek?: number; to?: number} = {}): Promise<Readable> {
     if (song.source === MediaSource.HLS) {
       return this.createReadStream({url: song.url, cacheKey: song.url});
     }
@@ -659,7 +674,6 @@ export default class {
       ffmpegInput = mediaSource.url;
 
       // Don't cache livestreams or long videos
-      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
       shouldCacheVideo = !mediaSource.isLive && song.length < MAX_CACHE_LENGTH_SECONDS && !options.seek;
 
       debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
@@ -705,6 +719,8 @@ export default class {
     this.playPositionInterval = setInterval(() => {
       this.positionInSeconds++;
     }, 1000);
+
+    this.scheduleNextTrackPrefetch();
   }
 
   private stopTrackingPosition(): void {
@@ -712,6 +728,91 @@ export default class {
       clearInterval(this.playPositionInterval);
       this.playPositionInterval = undefined;
     }
+
+    this.clearNextTrackPrefetchTimer();
+  }
+
+  private scheduleNextTrackPrefetch(): void {
+    this.clearNextTrackPrefetchTimer();
+
+    if (this.status !== STATUS.PLAYING || this.loopCurrentSong) {
+      return;
+    }
+
+    const currentSong = this.getCurrent();
+    const nextSong = this.getQueue()[0];
+    if (!currentSong || !this.isPrefetchable(nextSong)) {
+      return;
+    }
+
+    const remainingSeconds = Math.max(0, currentSong.length - this.positionInSeconds);
+    const delayMilliseconds = Math.max(
+      0,
+      (remainingSeconds - NEXT_TRACK_PREFETCH_LEAD_SECONDS) * 1000,
+    );
+
+    this.nextTrackPrefetchTimer = setTimeout(() => {
+      this.nextTrackPrefetchTimer = undefined;
+
+      // Queue mutations reschedule this timer, but re-check the target so a
+      // last-moment replacement can never make playback wait on stale work.
+      if (this.getQueue()[0] !== nextSong || this.status !== STATUS.PLAYING) {
+        this.scheduleNextTrackPrefetch();
+        return;
+      }
+
+      this.startNextTrackPrefetch(nextSong);
+    }, delayMilliseconds);
+  }
+
+  private clearNextTrackPrefetchTimer(): void {
+    if (this.nextTrackPrefetchTimer) {
+      clearTimeout(this.nextTrackPrefetchTimer);
+      this.nextTrackPrefetchTimer = undefined;
+    }
+  }
+
+  private isPrefetchable(song: QueuedSong | undefined): song is QueuedSong {
+    return Boolean(song
+      && song.source === MediaSource.Youtube
+      && !song.isLive
+      && song.length < MAX_CACHE_LENGTH_SECONDS);
+  }
+
+  private startNextTrackPrefetch(song: QueuedSong): void {
+    if (this.activePrefetches.has(song.url)) {
+      return;
+    }
+
+    const prefetch = this.prefetchSong(song)
+      .catch(error => {
+        const message = error instanceof Error ? error.message : String(error);
+        debug(`Next-track prefetch failed for ${song.url}: ${message}`);
+      })
+      .finally(() => {
+        this.activePrefetches.delete(song.url);
+      });
+
+    this.activePrefetches.set(song.url, prefetch);
+  }
+
+  private async prefetchSong(song: QueuedSong): Promise<void> {
+    const cacheKey = this.getHashForCache(song.url);
+    if (await this.fileCache.getPathFor(cacheKey)) {
+      debug(`Next track already cached: ${song.url}`);
+      return;
+    }
+
+    debug(`Prefetching next track: ${song.url}`);
+    const stream = await this.createSongStream(song);
+
+    await new Promise<void>((resolve, reject) => {
+      stream.once('end', resolve);
+      stream.once('error', reject);
+      stream.resume();
+    });
+
+    debug(`Next-track prefetch completed: ${song.url}`);
   }
 
   private attachListeners(): void {
@@ -937,6 +1038,9 @@ export default class {
         });
 
       stream.pipe(capacitor);
+      capacitor.once('finish', () => {
+        capacitor.release();
+      });
 
       returnedStream.on('close', () => {
         if (!options.cache) {

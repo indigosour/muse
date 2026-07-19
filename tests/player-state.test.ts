@@ -116,6 +116,7 @@ const getPrivateState = (player: Player) => player as unknown as {
   nowPlaying: QueuedSong | null;
   nowPlayingQueueEntryVersion: number | null;
   playAudioPlayerResource(resource: object): void;
+  prefetchSong(song: QueuedSong): Promise<void>;
 };
 
 const installVoiceActivityFakes = (player: Player) => {
@@ -682,6 +683,108 @@ describe('Player age-restricted fallback preservation', () => {
     expect(player.getQueue()).toEqual([]);
     expect(readyPlayer.getStream).toHaveBeenCalledOnce();
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('next-track prefetch', () => {
+  it('starts best-effort prefetch eight seconds before the current track ends', async () => {
+    const {player} = makeReadyPlayer();
+    const current = makeSong('Current', {length: 20});
+    const next = makeSong('Next');
+    const prefetchSong = vi.fn().mockResolvedValue(undefined);
+    Object.assign(player, {prefetchSong});
+    player.add(current);
+    player.add(next);
+
+    await player.play();
+    await vi.advanceTimersByTimeAsync(11_999);
+    expect(prefetchSong).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(prefetchSong).toHaveBeenCalledOnce();
+    expect(prefetchSong).toHaveBeenCalledWith(next);
+  });
+
+  it('reschedules prefetch for a new next track after a late queue insertion', async () => {
+    const {player} = makeReadyPlayer();
+    const current = makeSong('Current', {length: 20});
+    const originalNext = makeSong('Original next');
+    const replacement = makeSong('Replacement');
+    const prefetchSong = vi.fn().mockResolvedValue(undefined);
+    Object.assign(player, {prefetchSong});
+    player.add(current);
+    player.add(originalNext);
+
+    await player.play();
+    await vi.advanceTimersByTimeAsync(11_000);
+    player.add(replacement, {immediate: true});
+    await vi.advanceTimersByTimeAsync(999);
+    expect(prefetchSong).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(prefetchSong).toHaveBeenCalledOnce();
+    expect(prefetchSong).toHaveBeenCalledWith(replacement);
+  });
+
+  it('never waits for an in-flight prefetch when playback advances', async () => {
+    const {getStream, player} = makeReadyPlayer();
+    const current = makeSong('Current', {length: 10});
+    const next = makeSong('Next');
+    const prefetchResult = makeDeferred<void>();
+    const prefetchSong = vi.fn(() => prefetchResult.promise);
+    Object.assign(player, {prefetchSong});
+    player.add(current);
+    player.add(next);
+    await player.play();
+    getStream.mockClear();
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(prefetchSong).toHaveBeenCalledWith(next);
+
+    await player.forward(1);
+    expect(player.getCurrent()).toBe(next);
+    expect(getStream).toHaveBeenCalledOnce();
+    expect(getStream).toHaveBeenCalledWith(next, {seek: 0, to: 100});
+
+    prefetchResult.resolve(undefined);
+    await prefetchResult.promise;
+  });
+
+  it('starts a last-moment replacement immediately without waiting for its zero-delay prefetch', async () => {
+    const {getStream, player} = makeReadyPlayer();
+    const current = makeSong('Current', {length: 10});
+    const originalNext = makeSong('Original next');
+    const replacement = makeSong('Replacement');
+    const prefetchSong = vi.fn().mockResolvedValue(undefined);
+    Object.assign(player, {prefetchSong});
+    player.add(current);
+    player.add(originalNext);
+    await player.play();
+    getStream.mockClear();
+    await vi.advanceTimersByTimeAsync(9_900);
+
+    player.add(replacement, {immediate: true});
+    await player.forward(1);
+
+    expect(player.getCurrent()).toBe(replacement);
+    expect(getStream).toHaveBeenCalledOnce();
+    expect(getStream).toHaveBeenCalledWith(replacement, {seek: 0, to: 100});
+    expect(prefetchSong).not.toHaveBeenCalledWith(replacement);
+  });
+
+  it('warms the cache on a separate stream without stopping current playback', async () => {
+    const fileCache = {getPathFor: vi.fn().mockResolvedValue(null)};
+    const player = new Player(fileCache as never, GUILD_ID);
+    const prefetchedStream = Readable.from(['prefetched audio']);
+    const createSongStream = vi.fn().mockResolvedValue(prefetchedStream);
+    const stopAudioPlayer = vi.fn();
+    Object.assign(player, {createSongStream, stopAudioPlayer});
+    const next = makeSong('Next');
+
+    await getPrivateState(player).prefetchSong(next);
+
+    expect(createSongStream).toHaveBeenCalledWith(next);
+    expect(stopAudioPlayer).not.toHaveBeenCalled();
   });
 });
 
