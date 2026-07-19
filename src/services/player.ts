@@ -750,6 +750,7 @@ export default class {
       0,
       (remainingSeconds - NEXT_TRACK_PREFETCH_LEAD_SECONDS) * 1000,
     );
+    debug(`Next-track prefetch scheduled for ${nextSong.url} in ${delayMilliseconds}ms`);
 
     this.nextTrackPrefetchTimer = setTimeout(() => {
       this.nextTrackPrefetchTimer = undefined;
@@ -784,10 +785,15 @@ export default class {
       return;
     }
 
+    const startedAt = Date.now();
+    debug(`Next-track prefetch started: ${song.url}`);
     const prefetch = this.prefetchSong(song)
+      .then(() => {
+        debug(`Next-track prefetch completed in ${Date.now() - startedAt}ms: ${song.url}`);
+      })
       .catch(error => {
         const message = error instanceof Error ? error.message : String(error);
-        debug(`Next-track prefetch failed for ${song.url}: ${message}`);
+        debug(`Next-track prefetch failed after ${Date.now() - startedAt}ms for ${song.url}: ${message}`);
       })
       .finally(() => {
         this.activePrefetches.delete(song.url);
@@ -803,7 +809,6 @@ export default class {
       return;
     }
 
-    debug(`Prefetching next track: ${song.url}`);
     const stream = await this.createSongStream(song);
 
     await new Promise<void>((resolve, reject) => {
@@ -811,8 +816,6 @@ export default class {
       stream.once('error', reject);
       stream.resume();
     });
-
-    debug(`Next-track prefetch completed: ${song.url}`);
   }
 
   private attachListeners(): void {
